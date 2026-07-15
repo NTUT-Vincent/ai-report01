@@ -1,6 +1,6 @@
 # OKF Knowledge Factory MVP
 
-Local-first MVP for converting raw documents into reviewed OKF knowledge.
+Local-first MVP for converting raw documents into reviewed OKF knowledge with real OpenAI-compatible agents.
 
 This branch intentionally keeps infrastructure simple:
 
@@ -10,42 +10,35 @@ This branch intentionally keeps infrastructure simple:
 - Local file storage
 - FastAPI backend
 - PostgreSQL + JSONB + pgvector-ready schema
-- Basic React UI
-- Real OpenAI-compatible agents for classification, entity / alias resolution, and OKF building
+- React + Ant Design frontend
+- Playwright browser E2E tests
 
 ## Pipeline
 
 ```text
 Upload file
-→ metadata + sha256 fingerprint
+→ metadata + SHA-256 fingerprint
 → parse into parsed_json
 → Classification Agent
 → Entity / Alias Resolution Agent
-→ human review entity / alias decisions
+→ human entity / alias review when required
 → OKF Builder Agent
-→ validate OKF schema
-→ human approve OKF
-→ create searchable chunks
-→ search approved OKF
+→ deterministic schema validation
+→ human OKF approval
+→ searchable chunks
+→ approved OKF search
 ```
 
-## Local model contract
+## OpenAI-compatible model payload
 
-The backend calls an OpenAI-compatible endpoint:
-
-```text
-POST {base_url}/chat/completions
-Authorization: Bearer {api_key}
-```
-
-The model connection is supplied in each process/build request:
+The frontend sends the connection configuration only with process and build requests:
 
 ```json
 {
   "agent": {
     "base_url": "http://localhost:8000/v1",
     "model": "qwen-local",
-    "api_key": "your-local-key",
+    "api_key": "local-key",
     "temperature": 0,
     "timeout_seconds": 120,
     "use_response_format": false
@@ -53,26 +46,38 @@ The model connection is supplied in each process/build request:
 }
 ```
 
-`base_url`, `model`, and `api_key` are included in the request payload. The backend uses the key only for the outbound model call and does not persist it in PostgreSQL or artifacts. Error artifacts record only the model name and error message.
+The backend calls:
 
-Set `use_response_format=true` only when the local server supports OpenAI's `response_format: {"type":"json_object"}` option.
+```text
+POST {base_url}/chat/completions
+Authorization: Bearer {api_key}
+```
+
+The API key is not written to PostgreSQL or pipeline artifacts.
 
 ## Quick start
 
+Database:
+
 ```bash
-cp backend/.env.example backend/.env
 docker compose up -d db
+```
+
+Backend:
+
+```bash
 cd backend
+cp .env.example .env
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app_agent:app --reload
 ```
 
-Initialize the database once:
+Initialize tables and seed governed entities:
 
-```bash
-curl -X POST http://localhost:8000/db/init
+```text
+POST http://localhost:8000/db/init
 ```
 
 Frontend:
@@ -88,34 +93,36 @@ Open:
 - Backend API: http://localhost:8000/docs
 - Frontend: http://localhost:5173
 
-## API examples
+## Tests
 
-Process a parsed document with real agents:
-
-```bash
-curl -X POST http://localhost:8000/documents/DOCUMENT_ID/process \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "agent": {
-      "base_url": "http://localhost:8000/v1",
-      "model": "qwen-local",
-      "api_key": "local-key"
-    }
-  }'
-```
-
-Build OKF after entity review is complete:
+Backend integration tests:
 
 ```bash
-curl -X POST http://localhost:8000/documents/DOCUMENT_ID/build-okf \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "agent": {
-      "base_url": "http://localhost:8000/v1",
-      "model": "qwen-local",
-      "api_key": "local-key"
-    }
-  }'
+cd backend
+PYTHONPATH=. pytest -q
 ```
 
-The original `app.py` remains as an offline deterministic reference. Use `app_agent:app` for the real-agent implementation.
+Frontend production build:
+
+```bash
+cd frontend
+npm run build
+```
+
+Playwright browser tests require PostgreSQL, the backend, frontend, and an OpenAI-compatible endpoint. CI starts the included `backend/mock_llm.py` server automatically and executes:
+
+```bash
+cd frontend
+npm run test:e2e
+```
+
+The browser suite verifies:
+
+- upload through the React UI
+- real HTTP calls through the OpenAI-compatible agent client
+- classification and entity-resolution stages
+- OKF build, validation, approval, chunking, and search
+- unreachable model endpoint error handling
+- API key is not rendered in error output
+
+GitHub Actions runs backend tests, frontend build, and Playwright Chromium E2E on every PR update.
