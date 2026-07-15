@@ -1,0 +1,13 @@
+source_id: local_sop
+source_type: local_upload
+owner: CIM
+default_confidentiality: internal
+parser:
+  strategy: by_extension
+  supported_types: [pdf, docx, xlsx, md, txt]
+review:
+  entity_review_required: true
+  okf_review_required: true
+output:
+  format: okf
+  schema_version: v1
