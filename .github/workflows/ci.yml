@@ -31,6 +31,7 @@ jobs:
       RAW_DATA_DIR: ./data/raw
       MAX_UPLOAD_SIZE_MB: 20
       PYTHONWARNINGS: ignore
+      PYTHONPATH: .
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
