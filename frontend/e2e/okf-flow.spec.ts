@@ -19,12 +19,13 @@ test.beforeEach(async ({ request, page }) => {
   await configureAgent(page);
 });
 
-test('browser completes upload, agent processing, OKF approval, and search', async ({ page }) => {
-  const fileName = `playwright-${Date.now()}.txt`;
+test('browser completes upload, agent processing, OKF approval, and search', async ({ page }, testInfo) => {
+  const unique = `${Date.now()}-${testInfo.retry}-${Math.random()}`;
+  const fileName = `playwright-${unique}.txt`;
   await page.locator('input[type="file"]').setInputFiles({
     name: fileName,
     mimeType: 'text/plain',
-    buffer: Buffer.from('機台發生 alarm code 時，工程師必須依照 SOP 執行異常處理。'),
+    buffer: Buffer.from(`機台發生 alarm code 時，工程師必須依照 SOP 執行異常處理。測試識別碼：${unique}`),
   });
 
   const row = page.locator('tbody tr').filter({ hasText: fileName }).first();
@@ -46,13 +47,14 @@ test('browser completes upload, agent processing, OKF approval, and search', asy
   await expect(page.getByTestId('search-results')).toContainText('機台');
 });
 
-test('browser shows a safe error when the model endpoint is unreachable', async ({ page }) => {
+test('browser shows a safe error when the model endpoint is unreachable', async ({ page }, testInfo) => {
   await configureAgent(page, 'http://localhost:65530/v1');
-  const fileName = `broken-model-${Date.now()}.txt`;
+  const unique = `${Date.now()}-${testInfo.retry}-${Math.random()}`;
+  const fileName = `broken-model-${unique}.txt`;
   await page.locator('input[type="file"]').setInputFiles({
     name: fileName,
     mimeType: 'text/plain',
-    buffer: Buffer.from('This document validates model connection error handling.'),
+    buffer: Buffer.from(`This document validates model connection error handling. ${unique}`),
   });
 
   const row = page.locator('tbody tr').filter({ hasText: fileName }).first();
