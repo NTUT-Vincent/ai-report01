@@ -43,7 +43,15 @@ jobs:
       - name: Compile Python
         run: python -m py_compile app.py app_agent.py
       - name: Run backend tests
-        run: pytest -q --tb=short
+        run: pytest -q --tb=short --junitxml=test-results.xml 2>&1 | tee pytest.log; exit ${PIPESTATUS[0]}
+      - name: Upload backend diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-diagnostics
+          path: |
+            backend/pytest.log
+            backend/test-results.xml
 
   frontend:
     runs-on: ubuntu-latest
@@ -60,4 +68,10 @@ jobs:
       - name: Install frontend dependencies
         run: npm install --silent
       - name: Build frontend
-        run: npm run build --silent
+        run: npm run build --silent 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+      - name: Upload frontend diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-diagnostics
+          path: frontend/build.log
