@@ -98,7 +98,7 @@ jobs:
       RAW_DATA_DIR: ./backend/data/raw
       MAX_UPLOAD_SIZE_MB: 20
       PYTHONPATH: backend
-      VITE_API_BASE: http://127.0.0.1:8000
+      VITE_API_BASE: http://localhost:8000
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -124,7 +124,7 @@ jobs:
           nohup uvicorn mock_llm:app --host 127.0.0.1 --port 9000 > ../mock-llm.log 2>&1 &
           cd ../frontend
           nohup npm run dev -- --host 127.0.0.1 --port 5173 > ../frontend-e2e.log 2>&1 &
-          for url in http://127.0.0.1:8000/health http://127.0.0.1:9000/health http://127.0.0.1:5173; do
+          for url in http://localhost:8000/health http://localhost:9000/health http://localhost:5173; do
             for attempt in {1..60}; do
               if curl --fail --silent "$url" > /dev/null; then break; fi
               if [ "$attempt" -eq 60 ]; then echo "Service failed: $url"; exit 1; fi
