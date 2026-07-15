@@ -1,0 +1,11 @@
+CIM SOP - 機台異常處理
+
+本文件說明 CIM 團隊在機台發生 alarm code 時的標準作業程序。
+
+處理流程：
+1. 工程師先確認機台 alarm code。
+2. 依照 SOP 檢查目前站點與前一站點狀態。
+3. 若問題和 ABC Flow 有關，需通知值班工程師。
+4. 將處理結果寫入 maintenance record。
+
+ABC Flow 是目前文件中尚未建立的新流程名詞，用於測試 new_entity_candidate。
