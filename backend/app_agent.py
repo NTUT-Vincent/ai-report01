@@ -20,15 +20,14 @@ from app import (
     parse_file,
     save_artifact,
     set_status,
-    to_json,
     validate_okf_obj,
 )
 
 
 class AgentConnection(BaseModel):
-    base_url: str = Field(description="OpenAI-compatible base URL, for example http://localhost:8000/v1")
+    base_url: str = Field(min_length=1)
     model: str = Field(min_length=1)
-    api_key: SecretStr = Field(description="Bearer token sent only to the model API; never persisted")
+    api_key: SecretStr
     timeout_seconds: float = Field(default=120, ge=1, le=600)
     temperature: float = Field(default=0.0, ge=0, le=2)
     use_response_format: bool = False
@@ -52,7 +51,7 @@ class ClassificationResult(BaseModel):
     document_id: str
     confidentiality: Literal["public", "internal", "confidential", "restricted"]
     masking_required: bool
-    sensitive_spans: list[SensitiveSpan] = []
+    sensitive_spans: list[SensitiveSpan] = Field(default_factory=list)
     reason: str = Field(min_length=1)
     confidence: float = Field(ge=0, le=1)
 
@@ -76,7 +75,7 @@ class EntityResolutionItem(BaseModel):
 
 class EntityResolutionResult(BaseModel):
     document_id: str
-    entities: list[EntityResolutionItem]
+    entities: list[EntityResolutionItem] = Field(default_factory=list)
 
 
 def _remove_route(path: str, method: str) -> None:
@@ -96,9 +95,12 @@ _remove_route("/documents/{doc_id}/build-okf", "POST")
 
 def _chat_url(base_url: str) -> str:
     base = base_url.rstrip("/")
-    if base.endswith("/chat/completions"):
-        return base
-    return f"{base}/chat/completions"
+    return base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+
+
+def _json_safe(value: Any) -> Any:
+    """Round-trip arbitrary DB values such as UUID and datetime into JSON-safe values."""
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
 def _extract_json(content: str) -> dict[str, Any]:
@@ -131,7 +133,7 @@ def call_agent(
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": json.dumps(user_payload, ensure_ascii=False),
+                "content": json.dumps(user_payload, ensure_ascii=False, default=str),
             },
         ],
         "temperature": config.temperature,
@@ -148,16 +150,22 @@ def call_agent(
             response = client.post(_chat_url(config.base_url), headers=headers, json=request_payload)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        body = exc.response.text[:1000]
-        raise RuntimeError(f"model API returned {exc.response.status_code}: {body}") from exc
+        raise RuntimeError(
+            f"model API returned {exc.response.status_code}: {exc.response.text[:1000]}"
+        ) from exc
     except httpx.HTTPError as exc:
         raise RuntimeError(f"model API request failed: {exc}") from exc
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("model API returned non-JSON response") from exc
     try:
         content = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError("OpenAI-compatible response is missing choices[0].message.content") from exc
+        raise RuntimeError(
+            "OpenAI-compatible response is missing choices[0].message.content"
+        ) from exc
     if isinstance(content, list):
         content = "".join(
             item.get("text", "") if isinstance(item, dict) else str(item)
@@ -177,14 +185,12 @@ def call_validated_agent(
     try:
         return schema.model_validate(first)
     except ValidationError as first_error:
-        repair_prompt = (
-            system_prompt
-            + "\nYour previous response failed schema validation. Return only corrected JSON. "
-            + "Do not add markdown or explanations."
-        )
         repaired = call_agent(
             config,
-            system_prompt=repair_prompt,
+            system_prompt=(
+                system_prompt
+                + "\nThe previous output failed schema validation. Return only corrected JSON."
+            ),
             user_payload={
                 **user_payload,
                 "invalid_output": first,
@@ -200,45 +206,28 @@ Classify the document as public, internal, confidential, or restricted.
 Identify sensitive spans that may require masking.
 Return ONLY a JSON object with exactly these fields:
 document_id, confidentiality, masking_required, sensitive_spans, reason, confidence.
-Each sensitive_spans item must contain text, type, and optional suggested_mask.
-Use the source default as context, but override it when document content warrants a stricter level.
 Never invent sensitive content that is not present in the supplied document.
 """.strip()
 
-
 ENTITY_PROMPT = """
 You are the Entity and Alias Resolution Agent in an OKF ingestion pipeline.
-Extract only meaningful domain entities from the document and compare them against existing_entities.
-For every entity mention, choose exactly one decision:
-- existing_entity: exact or clearly confirmed existing canonical name/alias
-- alias_candidate: likely a new alias of an existing entity
-- new_entity_candidate: important new entity not represented in existing_entities
-- ambiguous: uncertain match or meaning
-- ignored: not useful as governed knowledge
-Return ONLY JSON with fields document_id and entities.
-Each entities item must contain mention, decision, suggested_entity_id, suggested_canonical_name,
-entity_type, confidence, reason, requires_review.
-Never claim an entity exists unless its ID is present in existing_entities.
-Only existing_entity with a strong exact match may set requires_review=false.
-Alias, new, and ambiguous decisions must set requires_review=true.
+Extract meaningful domain entities and compare them against existing_entities.
+Choose one decision per mention: existing_entity, alias_candidate,
+new_entity_candidate, ambiguous, or ignored.
+Return ONLY JSON with document_id and entities.
+Never claim an entity exists unless its ID appears in existing_entities.
+Only a strong exact existing match may set requires_review=false.
 """.strip()
-
 
 OKF_PROMPT = """
 You are the OKF Builder Agent.
 Convert the parsed document into one canonical OKF JSON object.
-Return ONLY JSON. Required top-level fields:
-okf_id, schema_version, title, source, confidentiality, summary,
-concepts, entities, procedures, relations, evidence, review_status.
-Rules:
-- review_status must be pending.
-- source.document_id and source.source_id must match the supplied metadata.
-- preserve the supplied confidentiality exactly.
-- use only approved_entity_mapping for governed entities; do not create formal entity IDs.
-- every important concept, procedure, and relation must cite one or more evidence_refs.
-- every evidence_ref must match an evidence.evidence_id in the same output.
-- evidence text must be grounded in parsed_json.
-- do not state uncertain information as fact.
+Return ONLY JSON with: okf_id, schema_version, title, source,
+confidentiality, summary, concepts, entities, procedures, relations,
+evidence, review_status.
+Use only approved_entity_mapping for governed entities.
+Every important concept, procedure, and relation must cite valid evidence_refs.
+Evidence must be grounded in parsed_json and review_status must be pending.
 """.strip()
 
 
@@ -279,7 +268,7 @@ def _entity_agent(
         user_payload={
             "document_id": doc_id,
             "parsed_json": parsed,
-            "existing_entities": entities,
+            "existing_entities": _json_safe(entities),
         },
         schema=EntityResolutionResult,
     )
@@ -306,7 +295,7 @@ def _okf_agent(
             },
             "parsed_json": parsed,
             "classification_result": classification,
-            "approved_entity_mapping": mapping,
+            "approved_entity_mapping": _json_safe(mapping),
             "schema_version": "v1",
         },
     )
@@ -321,37 +310,55 @@ def _okf_agent(
     return output
 
 
+def _save_agent_failure(
+    session: Session,
+    doc_id: str,
+    *,
+    stage: str,
+    model: str,
+    error: Exception,
+    status: str,
+) -> None:
+    save_artifact(
+        session,
+        doc_id,
+        "raw_agent_output",
+        {"stage": stage, "error": str(error), "model": model},
+    )
+    set_status(session, doc_id, status, str(error))
+
+
 @app.post("/documents/{doc_id}/process")
 def process_with_agents(
     doc_id: str,
     req: ProcessAgentRequest,
-    s: Session = Depends(db),
+    session: Session = Depends(db),
 ) -> dict[str, Any]:
-    doc = document(doc_id, s)
+    doc = document(doc_id, session)
     if doc["status"] == "DUPLICATE":
         raise HTTPException(400, "duplicate document cannot be processed")
     try:
-        set_status(s, doc_id, "PARSING")
+        set_status(session, doc_id, "PARSING")
         parsed = parse_file(doc)
-        save_artifact(s, doc_id, "parsed_json", parsed)
-        set_status(s, doc_id, "PARSED")
+        save_artifact(session, doc_id, "parsed_json", parsed)
+        set_status(session, doc_id, "PARSED")
 
-        set_status(s, doc_id, "CLASSIFYING")
+        set_status(session, doc_id, "CLASSIFYING")
         classification = _classification_agent(
             req.agent, doc_id=doc_id, doc=doc, parsed=parsed
         )
-        save_artifact(s, doc_id, "classification_result", classification)
-        set_status(s, doc_id, "CLASSIFIED")
+        save_artifact(session, doc_id, "classification_result", classification)
+        set_status(session, doc_id, "CLASSIFIED")
 
-        set_status(s, doc_id, "ENTITY_RESOLVING")
+        set_status(session, doc_id, "ENTITY_RESOLVING")
         resolved = _entity_agent(
             req.agent,
             doc_id=doc_id,
             parsed=parsed,
-            entities=existing_entities(s),
+            entities=existing_entities(session),
         )
-        save_artifact(s, doc_id, "entity_resolution_result", resolved)
-        s.execute(
+        save_artifact(session, doc_id, "entity_resolution_result", resolved)
+        session.execute(
             text(
                 "DELETE FROM entity_resolution_results WHERE document_id=:doc "
                 "AND review_status IN ('pending','auto_bound')"
@@ -359,14 +366,12 @@ def process_with_agents(
             {"doc": doc_id},
         )
         for item in resolved["entities"]:
-            auto_bound = (
+            auto_bound = bool(
                 item["decision"] == "existing_entity"
                 and item["confidence"] >= 0.95
                 and item.get("suggested_entity_id")
             )
-            review_status = "auto_bound" if auto_bound else "pending"
-            requires_review = not auto_bound
-            s.execute(
+            session.execute(
                 text(
                     """
                     INSERT INTO entity_resolution_results(
@@ -389,42 +394,42 @@ def process_with_agents(
                     "entity_type": item.get("entity_type"),
                     "confidence": item["confidence"],
                     "reason": item["reason"],
-                    "requires_review": requires_review,
-                    "review_status": review_status,
+                    "requires_review": not auto_bound,
+                    "review_status": "auto_bound" if auto_bound else "pending",
                 },
             )
-        s.commit()
-        pending = s.execute(
+        session.commit()
+        pending = session.execute(
             text(
                 "SELECT COUNT(*) FROM entity_resolution_results "
                 "WHERE document_id=:doc AND review_status='pending'"
             ),
             {"doc": doc_id},
         ).scalar_one()
-        final_status = "ENTITY_REVIEW_PENDING" if pending else "ENTITY_REVIEWED"
-        set_status(s, doc_id, final_status)
-        return {"document_id": doc_id, "status": final_status}
-    except (ValidationError, ValueError, RuntimeError, httpx.HTTPError) as exc:
-        save_artifact(
-            s,
-            doc_id,
-            "raw_agent_output",
-            {"stage": "process", "error": str(exc), "model": req.agent.model},
-        )
-        set_status(s, doc_id, "AGENT_FAILED", str(exc))
-        raise HTTPException(502, str(exc)) from exc
-    except Exception as exc:
-        set_status(s, doc_id, "FAILED", str(exc))
+        status = "ENTITY_REVIEW_PENDING" if pending else "ENTITY_REVIEWED"
+        set_status(session, doc_id, status)
+        return {"document_id": doc_id, "status": status}
+    except HTTPException:
         raise
+    except Exception as exc:
+        _save_agent_failure(
+            session,
+            doc_id,
+            stage="process",
+            model=req.agent.model,
+            error=exc,
+            status="AGENT_FAILED",
+        )
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.post("/documents/{doc_id}/build-okf")
 def build_okf_with_agent(
     doc_id: str,
     req: BuildOKFAgentRequest,
-    s: Session = Depends(db),
+    session: Session = Depends(db),
 ) -> dict[str, Any]:
-    pending = s.execute(
+    pending = session.execute(
         text(
             "SELECT COUNT(*) FROM entity_resolution_results "
             "WHERE document_id=:doc AND review_status='pending'"
@@ -433,25 +438,29 @@ def build_okf_with_agent(
     ).scalar_one()
     if pending:
         raise HTTPException(400, "entity review incomplete")
-    doc = document(doc_id, s)
-    parsed = latest_artifact(s, doc_id, "parsed_json")
-    classification = latest_artifact(s, doc_id, "classification_result")
+
+    doc = document(doc_id, session)
+    parsed = latest_artifact(session, doc_id, "parsed_json")
+    classification = latest_artifact(session, doc_id, "classification_result")
     try:
-        set_status(s, doc_id, "BUILDING_OKF")
+        set_status(session, doc_id, "BUILDING_OKF")
+        mapping = approved_mapping(session, doc_id)
         okf = _okf_agent(
             req.agent,
             doc_id=doc_id,
             doc=doc,
             parsed=parsed,
             classification=classification,
-            mapping=approved_mapping(s, doc_id),
+            mapping=mapping,
         )
         errors = validate_okf_obj(okf, doc_id)
         if errors:
-            repair_prompt = OKF_PROMPT + "\nFix all supplied validation errors and return the entire corrected OKF JSON."
             okf = call_agent(
                 req.agent,
-                system_prompt=repair_prompt,
+                system_prompt=(
+                    OKF_PROMPT
+                    + "\nFix every supplied validation error and return the full corrected JSON."
+                ),
                 user_payload={
                     "invalid_okf": okf,
                     "validation_errors": errors,
@@ -462,7 +471,7 @@ def build_okf_with_agent(
                     },
                     "parsed_json": parsed,
                     "classification_result": classification,
-                    "approved_entity_mapping": approved_mapping(s, doc_id),
+                    "approved_entity_mapping": _json_safe(mapping),
                 },
             )
             okf["source"] = {
@@ -475,27 +484,30 @@ def build_okf_with_agent(
             okf["review_status"] = "pending"
             errors = validate_okf_obj(okf, doc_id)
 
-        save_artifact(s, doc_id, "okf_candidate", okf)
+        save_artifact(session, doc_id, "okf_candidate", okf)
         save_artifact(
-            s,
+            session,
             doc_id,
             "schema_validation_result",
             {"valid": not errors, "errors": errors},
         )
         status = "OKF_REVIEW_PENDING" if not errors else "SCHEMA_INVALID"
-        set_status(s, doc_id, status)
+        set_status(session, doc_id, status)
         return {
             "document_id": doc_id,
             "status": status,
             "okf_json": okf,
             "errors": errors,
         }
-    except (ValidationError, ValueError, RuntimeError, httpx.HTTPError) as exc:
-        save_artifact(
-            s,
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _save_agent_failure(
+            session,
             doc_id,
-            "raw_agent_output",
-            {"stage": "build_okf", "error": str(exc), "model": req.agent.model},
+            stage="build_okf",
+            model=req.agent.model,
+            error=exc,
+            status="OKF_BUILD_FAILED",
         )
-        set_status(s, doc_id, "OKF_BUILD_FAILED", str(exc))
         raise HTTPException(502, str(exc)) from exc
